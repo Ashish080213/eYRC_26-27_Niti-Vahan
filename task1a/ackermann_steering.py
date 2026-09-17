@@ -9,7 +9,7 @@
 *
 *  Filename:         ackermann_steering.py
 *  Created:          2026
-*  Last Modified:
+*  Last Modified:    17-Sept-2026
 *  Author:           e-Yantra Team
 *
 *  You are ONLY allowed to write your code inside the block marked
@@ -19,11 +19,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < 1125 >
+# Author List:      < Penumetsa Sri Sai Ashish Varma >
 # Filename:         ackermann_steering.py
 # Functions:        ackermann_wheel_angles
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: < None >
 
 
 ####################### IMPORT MODULES #######################
@@ -68,9 +68,20 @@ def ackermann_wheel_angles(delta):
     WHEEL_OFFSET changes the effective half-track width inside each wheel's triangle.
     '''
 
+    if delta > 0:
+        sign = 1
+    else:
+        sign = -1
 
-    return left_angle, right_angle
+    if delta == 0:
+        RADIUS = float('inf')
+    else:
+        RADIUS = WHEELBASE / math.tan(abs(delta))
 
+    left_angle = math.atan(WHEELBASE / (RADIUS - TRACK_WIDTH / 2 + WHEEL_OFFSET))
+    right_angle = math.atan(WHEELBASE / (RADIUS + TRACK_WIDTH / 2 - WHEEL_OFFSET))
+
+    return sign * left_angle, sign * right_angle
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################
