@@ -9,7 +9,7 @@
 *
 *  Filename:         path_tracking.py
 *  Created:          2026
-*  Last Modified:
+*  Last Modified:    21-September-2026
 *  Author:           e-Yantra Team
 *
 *  You are ONLY allowed to write your code inside the block marked
@@ -19,8 +19,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < 1125 >
+# Author List:      < Penumetsa Sri Sai Ashish Varma >
 # Filename:         path_tracking.py
 # Functions:        ackermann_wheel_angles, compute_steering
 
@@ -70,6 +70,17 @@ def ackermann_wheel_angles(delta):
     left_wheel_angle = 0
     right_wheel_angle = 0
 
+    if delta == 0:
+        RADIUS = float('inf')
+    else:
+        RADIUS = WHEELBASE/math.tan(delta)
+        
+    left_wheel_angle = math.atan2(WHEELBASE, RADIUS-(TRACK_WIDTH/2)+WHEEL_OFFSET)
+    right_wheel_angle = math.atan2(WHEELBASE, RADIUS+(TRACK_WIDTH/2)-WHEEL_OFFSET)
+
+    if delta < 0:
+        return left_wheel_angle - math.pi, right_wheel_angle - math.pi
+    
     return left_wheel_angle, right_wheel_angle
 
 
@@ -111,6 +122,18 @@ def compute_steering(target_y, current_values):
     '''
 
     steering = 0
+    steering_min = -1.0
+    steering_max = 1.0
+    k_s = 0.5
+    k = 5
+    v = current_values["speed"]
+    e = current_values["y"] - target_y
+
+    psi_e = -current_values["yaw"]
+    psi_e = (psi_e + math.pi) % (2 * math.pi) - math.pi
+
+    steering = psi_e + math.atan2(k * e, k_s + v)
+    steering =  max(steering_min, min(steering_max, steering))
     return steering
 
 
