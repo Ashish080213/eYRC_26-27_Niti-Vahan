@@ -9,7 +9,7 @@
 *
 *  Filename:         lane_detection.py
 *  Created:          2026
-*  Last Modified:
+*  Last Modified:    02-October-2026
 *  Author:           e-Yantra Team
 *
 *  You are ONLY allowed to write your code inside the block marked
@@ -19,8 +19,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < 1125 >
+# Author List:      < Penumetsa Sri Sai Ashish Varma >
 # Filename:         lane_detection.py
 # Functions:        detect_lane
 # Global variables: < List any global variables you add, "None" if you add none >
@@ -39,70 +39,310 @@ import numpy as np
 LANE_LEFT = "left"
 LANE_RIGHT = "right"
 LANE_UNKNOWN = "unknown"
-VALID_LANES = (LANE_LEFT, LANE_RIGHT, LANE_UNKNOWN)
+Y_START = 260
+Y_END = 430
 
+YELLOW_LOW = np.array([15, 70, 70], dtype=np.uint8)
+YELLOW_HIGH = np.array([45, 255, 255], dtype=np.uint8)
 
-##############################################################
-############### ADD YOUR IMPLEMENTATION HERE #################
-##############################################################
+WHITE_LOW = np.array([0, 0, 170], dtype=np.uint8)
+WHITE_HIGH = np.array([180, 90, 255], dtype=np.uint8)
+
+_previous_center = None
+_previous_left = None
+_previous_right = None
+
+def get_marking_x(mask, x_min, x_max):
+
+    region = mask[Y_START:Y_END, x_min:x_max]
+
+    if region.size == 0:
+        return None
+
+    column_count = np.sum(region > 0, axis=0)
+
+    if column_count.max() == 0:
+        return None
+
+    threshold = max(2, int(column_count.max() * 0.15))
+
+    xs = np.where(column_count >= threshold)[0]
+
+    if len(xs) == 0:
+        return None
+
+    weights = column_count[xs].astype(np.float32)
+
+    x = np.average(
+        xs + x_min,
+        weights=weights
+    )
+
+    return float(x)
+
+def get_markings(mask):
+    """
+    Find possible vertical/diagonal lane markings.
+
+    Instead of Hough lines, divide the image into x regions
+    and use the number of colored pixels.
+    """
+
+    region = mask[Y_START:Y_END, :]
+
+    column_count = np.sum(region > 0, axis=0).astype(np.float32)
+
+    if column_count.max() < 3:
+        return []
+
+    smooth = cv2.GaussianBlur(
+        column_count.reshape(1, -1),
+        (1, 15),
+        0
+    ).reshape(-1)
+
+    threshold = max(
+        3.0,
+        smooth.max() * 0.15
+    )
+
+    active = smooth >= threshold
+
+    markings = []
+
+    start = None
+
+    for i, value in enumerate(active):
+
+        if value and start is None:
+            start = i
+
+        elif not value and start is not None:
+
+            end = i
+
+            if end - start >= 2:
+
+                xs = np.arange(start, end)
+
+                weights = smooth[start:end]
+
+                if weights.sum() > 0:
+                    center = np.average(
+                        xs,
+                        weights=weights
+                    )
+                else:
+                    center = (start + end) / 2
+
+                strength = float(
+                    smooth[start:end].max()
+                )
+
+                markings.append(
+                    (
+                        float(center),
+                        strength
+                    )
+                )
+
+            start = None
+
+    if start is not None:
+
+        end = len(active)
+
+        if end - start >= 2:
+
+            xs = np.arange(start, end)
+            weights = smooth[start:end]
+
+            if weights.sum() > 0:
+                center = np.average(
+                    xs,
+                    weights=weights
+                )
+            else:
+                center = (start + end) / 2
+
+            strength = float(
+                smooth[start:end].max()
+            )
+
+            markings.append(
+                (
+                    float(center),
+                    strength
+                )
+            )
+
+    return markings
+
+def find_lane_pair(yellow, white, width):
+
+    if not yellow or not white:
+        return None
+
+    candidates = []
+
+    MIN_WIDTH = 100
+    MAX_WIDTH = 450
+
+    for yx, ys in yellow:
+
+        for wx, ws in white:
+
+            distance = abs(wx - yx)
+
+            if distance < MIN_WIDTH:
+                continue
+
+            if distance > MAX_WIDTH:
+                continue
+
+            left = min(yx, wx)
+            right = max(yx, wx)
+
+            center = (left + right) / 2.0
+
+            center_error = abs(
+                center - width * 0.5
+            )
+
+            strength = ys + ws
+
+            score = (
+                center_error / 120.0
+                + distance / 500.0
+                - strength / 100.0
+            )
+
+            candidates.append(
+                (
+                    score,
+                    left,
+                    right,
+                    yx,
+                    wx
+                )
+            )
+
+    if not candidates:
+        return None
+
+    if _previous_center is not None:
+
+        adjusted = []
+
+        for item in candidates:
+
+            score, left, right, yx, wx = item
+
+            center = (left + right) / 2.0
+
+            score += abs(
+                center - _previous_center
+            ) / 100.0
+
+            adjusted.append(
+                (
+                    score,
+                    left,
+                    right,
+                    yx,
+                    wx
+                )
+            )
+
+        candidates = adjusted
+
+    return min(
+        candidates,
+        key=lambda x: x[0]
+    )
 
 def detect_lane(frame):
-    '''
-    Purpose:
-    ---
-    Detect the lane in a single frame and report where the centre of the lane
-    is, and which of the two lanes the vehicle is currently in.
 
-    Input Arguments:
-    ---
-    `frame` :   [ numpy.ndarray ]
-        A single BGR frame read from the video, of shape (height, width, 3).
+    global _previous_center
+    global _previous_left
+    global _previous_right
 
-    Returns:
-    ---
-    `result` :  [ dict ]
-        {
-            "center_x" : int,   x-pixel of the lane centre in this frame,
-                                or -1 if the lane could not be found
-            "lane"     : str,   "left", "right" or "unknown"
+    if frame is None:
+        return {
+            "center_x": -1,
+            "lane": LANE_UNKNOWN
         }
 
-    Example call:
-    ---
-    result = detect_lane(frame)
+    hsv = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2HSV
+    )
 
-    COORDINATE SYSTEM:
-    ---
-    `center_x` is an absolute pixel column in the frame AS RECEIVED - the
-    dataset's own resolution, 640x480. It is compared against a ground truth
-    measured in those pixels, so it only means anything in them.
+    yellow_mask = cv2.inRange(
+        hsv,
+        YELLOW_LOW,
+        YELLOW_HIGH
+    )
 
-    You may resize, crop or warp all you like inside this function, but scale
-    the answer back before returning it. A centre found in a 320x240 copy is
-    half the value it should be, and a centre read off a bird's-eye view is in
-    warped coordinates, not frame ones - map the point back through the inverse
-    of your transform. Do not re-encode or resize the clip files themselves.
+    white_mask = cv2.inRange(
+        hsv,
+        WHITE_LOW,
+        WHITE_HIGH
+    )
 
-    NOTE:
-    ---
-    This function must ONLY compute and return the result.
-    Do not call cv2.imshow(), cv2.waitKey(), cv2.imwrite() or print() from
-    inside it. All visualisation and debugging output belongs outside this
-    function - see draw_overlay() and process_video() below.
-    '''
+    yellow_mask[:Y_START, :] = 0
+    yellow_mask[Y_END:, :] = 0
 
-    center_x = -1
-    lane = LANE_UNKNOWN
+    white_mask[:Y_START, :] = 0
+    white_mask[Y_END:, :] = 0
 
-    #################### ADD YOUR CODE HERE ####################
-    # 1. Isolate the lane markings in `frame`
-    # 2. Work out which two markings bracket the vehicle
-    # 3. Compute the x-pixel of the lane centre   ->  center_x
-    # 4. Decide which lane the vehicle is in      ->  lane
-    ############################################################
+    yellow = get_markings(
+        yellow_mask
+    )
 
-    return {"center_x": center_x, "lane": lane}
+    white = get_markings(
+        white_mask
+    )
 
+    pair = find_lane_pair(
+        yellow,
+        white,
+        frame.shape[1]
+    )
+
+    if pair is None:
+
+        return {
+            "center_x": -1,
+            "lane": LANE_UNKNOWN
+        }
+
+    _, left, right, yellow_x, white_x = pair
+
+    center = (
+        left + right
+    ) / 2.0
+
+    center_x = int(
+        round(center)
+    )
+
+    if yellow_x < white_x:
+
+        lane = LANE_LEFT
+
+    else:
+
+        lane = LANE_RIGHT
+
+    _previous_center = center
+    _previous_left = left
+    _previous_right = right
+
+    return {
+        "center_x": int(center_x),
+        "lane": lane
+    }
 
 # ------------------------------------------------------------------
 # Add any helper functions and global variables you need below this

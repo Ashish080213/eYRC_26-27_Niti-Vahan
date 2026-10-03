@@ -1,0 +1,1564 @@
+"""
+Lane Center Detection
+=====================
+
+Methods used:
+    1. Canny Edge Detection
+    2. Hough Line Transform
+
+The detector is designed for the supplied first-person CARLA-style
+road videos where the car's lane is bounded by:
+    - one yellow road marking
+    - one white road marking (dashed lane divider)
+
+For every frame:
+    center_y is fixed at Y_AXIS = 380
+    center_x = (left_boundary_x + right_boundary_x) / 2
+
+Important:
+    The color masks are NOT a third lane-detection method. They are
+    used only to classify Hough line candidates as yellow or white.
+    Canny + Hough remain the actual line-detection methods.
+
+Run:
+    python lane_center_detection.py
+
+Or choose another video:
+    python lane_center_detection.py --input clip_11.mp4
+
+Dependencies:
+    opencv-python
+    numpy
+    pandas
+"""
+
+import argparse
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DEFAULT_INPUT_VIDEO = r"C:\Users\varma\Documents\Competitions\eYRC 26-27\Niti Vahan\Task1\Code Files\eYRC_26-27_Niti-Vahan\task1c\public\clip_11.mp4"
+
+# Fixed horizontal axis requested by the user.
+Y_AXIS = 380
+
+# Canny parameters.
+CANNY_LOW = 50
+CANNY_HIGH = 150
+
+# Hough parameters.
+HOUGH_RHO = 1
+HOUGH_THETA = np.pi / 180
+HOUGH_THRESHOLD = 15
+HOUGH_MIN_LINE_LENGTH = 20
+HOUGH_MAX_LINE_GAP = 50
+
+# Lane width allowed at Y_AXIS.
+MIN_LANE_WIDTH = 120
+MAX_LANE_WIDTH = 600
+
+# Initial camera/lane geometry.
+#
+# This is NOT used after the first frame.
+# It is only used to select the correct yellow+white pair
+# in the first frame. The value comes from the supplied videos,
+# where the lane center at Y=380 is around 36% of image width.
+INITIAL_CENTER_FRACTION = 0.36
+
+# Expected initial lane width. This is a weak term only.
+INITIAL_WIDTH = 250.0
+
+# Output files are written to the directory from which the script
+# is executed. This avoids creating:
+#     lane_center_result/lane_center_result/
+OUTPUT_DIR = Path(".")
+
+ANNOTATED_VIDEO_NAME = "annotated_lane_center_2.mp4"
+MASK_VIDEO_NAME = "lane_segmentation_mask_2.mp4"
+CSV_NAME = "center_points_2.csv"
+FRAMES_DIR_NAME = "frames_2"
+
+SAVE_INDIVIDUAL_FRAMES = True
+JPEG_QUALITY = 92
+
+
+# ============================================================
+# BASIC GEOMETRY
+# ============================================================
+
+def x_at_y(x1, y1, x2, y2, y):
+    """Return x where the line through two points intersects y."""
+    dy = y2 - y1
+
+    if abs(dy) < 1e-6:
+        return None
+
+    return x1 + (y - y1) * (x2 - x1) / dy
+
+
+def weighted_average(values, weights):
+    """Weighted average with safe handling."""
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    if len(values) == 0:
+        return None
+
+    if np.sum(weights) <= 0:
+        return float(np.mean(values))
+
+    return float(np.average(values, weights=weights))
+
+
+# ============================================================
+# COLOR CLASSIFICATION
+# ============================================================
+
+def create_color_masks(frame):
+    """
+    Create yellow and white masks.
+
+    These masks are used only to classify Hough detections.
+    """
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Yellow road marking.
+    yellow_mask = cv2.inRange(
+        hsv,
+        np.array([15, 80, 80], dtype=np.uint8),
+        np.array([45, 255, 255], dtype=np.uint8)
+    )
+
+    # White road marking.
+    white_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, 170], dtype=np.uint8),
+        np.array([180, 90, 255], dtype=np.uint8)
+    )
+
+    return yellow_mask, white_mask
+
+
+def line_mask_score(mask, line):
+    """
+    Measure how much of a Hough line's neighbourhood belongs
+    to a particular color mask.
+
+    A small 7x7 neighbourhood is used because Hough often detects
+    the edge of a thick road marking rather than its exact centre.
+    """
+
+    x1, y1, x2, y2 = line
+
+    length = int(
+        max(
+            abs(x2 - x1),
+            abs(y2 - y1)
+        )
+    ) + 1
+
+    if length < 2:
+        return 0.0
+
+    xs = np.linspace(x1, x2, length)
+    ys = np.linspace(y1, y2, length)
+
+    total = 0.0
+    count = 0
+
+    for dx in range(-3, 4):
+        for dy in range(-3, 4):
+
+            xi = np.clip(
+                np.round(xs + dx).astype(np.int32),
+                0,
+                mask.shape[1] - 1
+            )
+
+            yi = np.clip(
+                np.round(ys + dy).astype(np.int32),
+                0,
+                mask.shape[0] - 1
+            )
+
+            total += float(
+                np.mean(mask[yi, xi] > 0)
+            )
+
+            count += 1
+
+    return total / count
+
+
+# ============================================================
+# HOUGH CANDIDATES
+# ============================================================
+
+def get_hough_candidates(frame):
+    """
+    Detect road-marking line candidates using:
+
+        grayscale
+            ↓
+        Canny
+            ↓
+        ROI
+            ↓
+        HoughLinesP
+
+    Every Hough line is then classified as yellow/white using
+    the color masks.
+    """
+
+    height, width = frame.shape[:2]
+
+    # --------------------------------------------------------
+    # 1. Grayscale
+    # --------------------------------------------------------
+
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    # --------------------------------------------------------
+    # 2. Canny
+    # --------------------------------------------------------
+
+    edges = cv2.Canny(
+        gray,
+        CANNY_LOW,
+        CANNY_HIGH,
+        apertureSize=3
+    )
+
+    # --------------------------------------------------------
+    # 3. Road ROI
+    #
+    # The supplied videos show the road occupying this region.
+    # Keeping building/background edges out improves Hough.
+    # --------------------------------------------------------
+
+    roi_mask = np.zeros_like(edges)
+
+    roi_polygon = np.array(
+        [[
+            (0, height - 5),
+            (100, 80),
+            (540, 80),
+            (width - 1, height - 5)
+        ]],
+        dtype=np.int32
+    )
+
+    cv2.fillPoly(
+        roi_mask,
+        roi_polygon,
+        255
+    )
+
+    roi_edges = cv2.bitwise_and(
+        edges,
+        roi_mask
+    )
+
+    # --------------------------------------------------------
+    # 4. Hough
+    # --------------------------------------------------------
+
+    lines = cv2.HoughLinesP(
+        roi_edges,
+        rho=HOUGH_RHO,
+        theta=HOUGH_THETA,
+        threshold=HOUGH_THRESHOLD,
+        minLineLength=HOUGH_MIN_LINE_LENGTH,
+        maxLineGap=HOUGH_MAX_LINE_GAP
+    )
+
+    if lines is None:
+        return [], edges, roi_edges
+
+    # IMPORTANT:
+    # OpenCV installations can return HoughLinesP as either
+    # (N, 1, 4) or (N, 4).
+    #
+    # Normalize both forms.
+    lines = np.asarray(lines).reshape(-1, 4)
+
+    yellow_mask, white_mask = create_color_masks(frame)
+
+    candidates = []
+
+    for raw_line in lines:
+
+        x1, y1, x2, y2 = map(
+            float,
+            raw_line
+        )
+
+        dy = y2 - y1
+
+        if abs(dy) < 5:
+            continue
+
+        length = float(
+            np.hypot(
+                x2 - x1,
+                y2 - y1
+            )
+        )
+
+        if length < HOUGH_MIN_LINE_LENGTH:
+            continue
+
+        # Project the Hough line to the fixed Y axis.
+        x_ref = x_at_y(
+            x1,
+            y1,
+            x2,
+            y2,
+            Y_AXIS
+        )
+
+        if x_ref is None:
+            continue
+
+        # Allow a boundary to be slightly outside the image.
+        # This is important when the white dashed boundary moves
+        # outside the left side of the camera image.
+        if x_ref < -150 or x_ref > width + 150:
+            continue
+
+        y_low = min(y1, y2)
+        y_high = max(y1, y2)
+
+        # Ignore lines completely above the useful road area.
+        if y_high < 90:
+            continue
+
+        line = (
+            int(round(x1)),
+            int(round(y1)),
+            int(round(x2)),
+            int(round(y2))
+        )
+
+        yellow_score = line_mask_score(
+            yellow_mask,
+            line
+        )
+
+        white_score = line_mask_score(
+            white_mask,
+            line
+        )
+
+        # ----------------------------------------------------
+        # Classify Hough line.
+        # ----------------------------------------------------
+
+        color_threshold = 0.12
+
+        if (
+            yellow_score > white_score
+            and yellow_score >= color_threshold
+        ):
+            color = "yellow"
+            color_score = yellow_score
+
+        elif (
+            white_score > yellow_score
+            and white_score >= color_threshold
+        ):
+            color = "white"
+            color_score = white_score
+
+        else:
+            continue
+
+        candidates.append(
+            {
+                "x": float(x_ref),
+                "length": length,
+                "line": line,
+                "color": color,
+                "color_score": float(color_score),
+                "yellow_score": float(yellow_score),
+                "white_score": float(white_score),
+                "y_low": float(y_low),
+                "y_high": float(y_high)
+            }
+        )
+
+    return candidates, edges, roi_edges
+
+
+# ============================================================
+# CANDIDATE CLUSTERING
+# ============================================================
+
+def cluster_candidates(candidates):
+    """
+    Several Hough segments often represent the same physical
+    road marking.
+
+    Cluster detections whose projected X positions are close.
+    """
+
+    clusters = []
+
+    for color in ("yellow", "white"):
+
+        color_candidates = sorted(
+            [
+                c for c in candidates
+                if c["color"] == color
+            ],
+            key=lambda c: c["x"]
+        )
+
+        current = []
+
+        for candidate in color_candidates:
+
+            if not current:
+                current = [candidate]
+                continue
+
+            if (
+                candidate["x"]
+                - current[-1]["x"]
+                <= 8
+            ):
+                current.append(candidate)
+
+            else:
+                clusters.append(current)
+                current = [candidate]
+
+        if current:
+            clusters.append(current)
+
+    representatives = []
+
+    for cluster in clusters:
+
+        weights = np.array(
+            [
+                c["length"]
+                * c["color_score"]
+                for c in cluster
+            ],
+            dtype=float
+        )
+
+        xs = np.array(
+            [
+                c["x"]
+                for c in cluster
+            ],
+            dtype=float
+        )
+
+        representative_x = weighted_average(
+            xs,
+            weights
+        )
+
+        best = max(
+            cluster,
+            key=lambda c:
+                c["length"]
+                * c["color_score"]
+        )
+
+        representatives.append(
+            {
+                "x": representative_x,
+                "length": float(
+                    np.sum(
+                        [
+                            c["length"]
+                            for c in cluster
+                        ]
+                    )
+                ),
+                "line": best["line"],
+                "color": best["color"],
+                "color_score": float(
+                    max(
+                        c["color_score"]
+                        for c in cluster
+                    )
+                ),
+                "y_low": best["y_low"],
+                "y_high": best["y_high"]
+            }
+        )
+
+    return representatives
+
+
+# ============================================================
+# BUILD POSSIBLE LANE PAIRS
+# ============================================================
+
+def build_lane_pairs(representatives):
+    """
+    A valid lane is bounded by one yellow and one white marking.
+
+    The yellow/white ordering is NOT assumed.
+
+    Therefore both cases are supported:
+
+        yellow -> white
+
+    and:
+
+        white -> yellow
+    """
+
+    yellow = [
+        c for c in representatives
+        if c["color"] == "yellow"
+    ]
+
+    white = [
+        c for c in representatives
+        if c["color"] == "white"
+    ]
+
+    pairs = []
+
+    for y in yellow:
+
+        for w in white:
+
+            if w["x"] < y["x"]:
+                left = w
+                right = y
+
+            else:
+                left = y
+                right = w
+
+            lane_width = (
+                right["x"]
+                - left["x"]
+            )
+
+            if not (
+                MIN_LANE_WIDTH
+                <= lane_width
+                <= MAX_LANE_WIDTH
+            ):
+                continue
+
+            center = (
+                left["x"]
+                + right["x"]
+            ) / 2.0
+
+            pairs.append(
+                {
+                    "left": left,
+                    "right": right,
+                    "width": float(lane_width),
+                    "center": float(center)
+                }
+            )
+
+    return pairs
+
+
+# ============================================================
+# SELECT CORRECT LANE
+# ============================================================
+
+def select_lane_pair(
+    pairs,
+    previous_state,
+    image_width
+):
+    """
+    Select the lane occupied by the vehicle.
+
+    First frame:
+        use the known camera geometry only to initialize.
+
+    Later frames:
+        track the previously detected yellow/white boundaries,
+        while still re-evaluating Hough detections every frame.
+
+    No center point is fabricated when there are no usable
+    yellow+white Hough detections.
+    """
+
+    if not pairs:
+        return None
+
+    initial_center = (
+        image_width
+        * INITIAL_CENTER_FRACTION
+    )
+
+    scored = []
+
+    for pair in pairs:
+
+        left = pair["left"]
+        right = pair["right"]
+
+        center = pair["center"]
+        width = pair["width"]
+
+        color_strength = (
+            left["color_score"]
+            + right["color_score"]
+        )
+
+        score = 0.0
+
+        # ----------------------------------------------------
+        # First frame.
+        # ----------------------------------------------------
+
+        if previous_state is None:
+
+            # Strongly prefer the expected camera/lane center.
+            score += (
+                abs(center - initial_center)
+                / 40.0
+            )
+
+            # Width is only a weak tie-breaker.
+            score += (
+                abs(width - INITIAL_WIDTH)
+                / 300.0
+            )
+
+        # ----------------------------------------------------
+        # Subsequent frames.
+        # ----------------------------------------------------
+
+        else:
+
+            previous_left = (
+                previous_state["left_x"]
+            )
+
+            previous_right = (
+                previous_state["right_x"]
+            )
+
+            previous_width = (
+                previous_state["width"]
+            )
+
+            # Track each boundary independently.
+            score += (
+                abs(
+                    left["x"]
+                    - previous_left
+                )
+                / 80.0
+            )
+
+            score += (
+                abs(
+                    right["x"]
+                    - previous_right
+                )
+                / 80.0
+            )
+
+            # Keep lane-width changes reasonable.
+            score += (
+                abs(
+                    width
+                    - previous_width
+                )
+                / 180.0
+            )
+
+        # Stronger marking evidence is preferred.
+        score -= (
+            0.5
+            * color_strength
+        )
+
+        # ----------------------------------------------------
+        # Reject obvious car-hood detections.
+        #
+        # In the supplied videos, short white Hough lines
+        # entirely at the bottom can come from the car itself.
+        # ----------------------------------------------------
+
+        for boundary in (left, right):
+
+            x1, y1, x2, y2 = (
+                boundary["line"]
+            )
+
+            if (
+                min(y1, y2) > 420
+                and 150 < boundary["x"] < 450
+            ):
+                score += 1.0
+
+        pair["score"] = score
+
+        scored.append(pair)
+
+    return min(
+        scored,
+        key=lambda p: p["score"]
+    )
+
+
+# ============================================================
+# LINE / SEGMENTATION GEOMETRY
+# ============================================================
+
+def boundary_x_from_line(boundary, y):
+    """Project the selected Hough boundary to any Y coordinate."""
+
+    x1, y1, x2, y2 = boundary["line"]
+
+    return x_at_y(
+        x1,
+        y1,
+        x2,
+        y2,
+        y
+    )
+
+
+def create_lane_mask(
+    frame_shape,
+    left_boundary,
+    right_boundary
+):
+    """
+    Create a binary mask of the detected lane.
+
+    The polygon is formed from the selected Hough lines.
+    """
+
+    height, width = frame_shape[:2]
+
+    mask = np.zeros(
+        (height, width),
+        dtype=np.uint8
+    )
+
+    if (
+        left_boundary is None
+        or right_boundary is None
+    ):
+        return mask
+
+    # Top of road region.
+    top_y = 120
+
+    # Bottom of the useful look-ahead area.
+    bottom_y = min(
+        height - 1,
+        Y_AXIS + 50
+    )
+
+    left_top = boundary_x_from_line(
+        left_boundary,
+        top_y
+    )
+
+    right_top = boundary_x_from_line(
+        right_boundary,
+        top_y
+    )
+
+    left_bottom = boundary_x_from_line(
+        left_boundary,
+        bottom_y
+    )
+
+    right_bottom = boundary_x_from_line(
+        right_boundary,
+        bottom_y
+    )
+
+    if None in (
+        left_top,
+        right_top,
+        left_bottom,
+        right_bottom
+    ):
+        return mask
+
+    # Clip to image boundaries.
+    left_top = int(
+        np.clip(
+            left_top,
+            0,
+            width - 1
+        )
+    )
+
+    right_top = int(
+        np.clip(
+            right_top,
+            0,
+            width - 1
+        )
+    )
+
+    left_bottom = int(
+        np.clip(
+            left_bottom,
+            0,
+            width - 1
+        )
+    )
+
+    right_bottom = int(
+        np.clip(
+            right_bottom,
+            0,
+            width - 1
+        )
+    )
+
+    # Make sure the polygon has valid left/right ordering.
+    if left_top >= right_top:
+        return mask
+
+    if left_bottom >= right_bottom:
+        return mask
+
+    polygon = np.array(
+        [[
+            (left_top, top_y),
+            (right_top, top_y),
+            (right_bottom, bottom_y),
+            (left_bottom, bottom_y)
+        ]],
+        dtype=np.int32
+    )
+
+    cv2.fillPoly(
+        mask,
+        polygon,
+        255
+    )
+
+    return mask
+
+
+# ============================================================
+# DRAW RESULT
+# ============================================================
+
+def draw_result(
+    frame,
+    lane_pair,
+    lane_mask,
+    hough_candidates,
+    frame_number
+):
+    """Draw Hough lines, lane segmentation and center point."""
+
+    output = frame.copy()
+
+    height, width = output.shape[:2]
+
+    # --------------------------------------------------------
+    # Draw selected Hough boundary candidates.
+    # --------------------------------------------------------
+
+    if lane_pair is not None:
+
+        left = lane_pair["left"]
+        right = lane_pair["right"]
+
+        for boundary, color in (
+            (left, (0, 255, 255)),
+            (right, (255, 0, 255))
+        ):
+
+            x1, y1, x2, y2 = (
+                boundary["line"]
+            )
+
+            cv2.line(
+                output,
+                (x1, y1),
+                (x2, y2),
+                color,
+                2,
+                cv2.LINE_AA
+            )
+
+    # --------------------------------------------------------
+    # Lane segmentation overlay.
+    # --------------------------------------------------------
+
+    if np.any(lane_mask):
+
+        overlay = output.copy()
+
+        overlay[
+            lane_mask > 0
+        ] = (
+            0.65
+            * overlay[lane_mask > 0]
+            + 0.35
+            * np.array(
+                [0, 180, 255],
+                dtype=np.float32
+            )
+        ).astype(np.uint8)
+
+        output = overlay
+
+    # --------------------------------------------------------
+    # Fixed horizontal axis.
+    # --------------------------------------------------------
+
+    cv2.line(
+        output,
+        (0, Y_AXIS),
+        (width - 1, Y_AXIS),
+        (255, 255, 0),
+        2
+    )
+
+    # --------------------------------------------------------
+    # Center point.
+    # --------------------------------------------------------
+
+    if lane_pair is not None:
+
+        left_x = lane_pair["left"]["x"]
+        right_x = lane_pair["right"]["x"]
+
+        center_x = (
+            left_x
+            + right_x
+        ) / 2.0
+
+        cx = int(
+            round(center_x)
+        )
+
+        # Left boundary point.
+        if 0 <= int(round(left_x)) < width:
+            cv2.circle(
+                output,
+                (
+                    int(round(left_x)),
+                    Y_AXIS
+                ),
+                5,
+                (0, 255, 255),
+                -1
+            )
+
+        # Right boundary point.
+        if 0 <= int(round(right_x)) < width:
+            cv2.circle(
+                output,
+                (
+                    int(round(right_x)),
+                    Y_AXIS
+                ),
+                5,
+                (255, 0, 255),
+                -1
+            )
+
+        # Center point.
+        if 0 <= cx < width:
+
+            cv2.circle(
+                output,
+                (cx, Y_AXIS),
+                8,
+                (0, 0, 255),
+                -1
+            )
+
+            cv2.line(
+                output,
+                (cx, Y_AXIS - 25),
+                (cx, Y_AXIS + 25),
+                (0, 255, 0),
+                2
+            )
+
+        cv2.putText(
+            output,
+            f"Center = ({center_x:.1f}, {Y_AXIS})",
+            (15, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.70,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            output,
+            f"Frame = {frame_number}",
+            (15, height - 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            output,
+            (
+                f"Left={left_x:.1f}  "
+                f"Right={right_x:.1f}"
+            ),
+            (15, height - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    else:
+
+        cv2.putText(
+            output,
+            "Lane center not detected",
+            (15, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.70,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            output,
+            f"Frame = {frame_number}",
+            (15, height - 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    return output
+
+
+# ============================================================
+# PROCESS VIDEO
+# ============================================================
+
+def process_video(input_video):
+    """Process the complete video frame-by-frame."""
+
+    # Make probabilistic Hough output reproducible across runs.
+    cv2.setRNGSeed(42)
+
+    input_path = Path(input_video)
+
+    if not input_path.exists():
+
+        raise FileNotFoundError(
+            f"Input video not found: {input_path}"
+        )
+
+    output_dir = OUTPUT_DIR
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    frames_dir = (
+        output_dir
+        / FRAMES_DIR_NAME
+    )
+
+    if SAVE_INDIVIDUAL_FRAMES:
+
+        frames_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    annotated_path = (
+        output_dir
+        / ANNOTATED_VIDEO_NAME
+    )
+
+    mask_path = (
+        output_dir
+        / MASK_VIDEO_NAME
+    )
+
+    csv_path = (
+        output_dir
+        / CSV_NAME
+    )
+
+    # --------------------------------------------------------
+    # Open input.
+    # --------------------------------------------------------
+
+    cap = cv2.VideoCapture(
+        str(input_path)
+    )
+
+    if not cap.isOpened():
+
+        raise RuntimeError(
+            f"OpenCV could not open: {input_path}"
+        )
+
+    fps = cap.get(
+        cv2.CAP_PROP_FPS
+    )
+
+    if fps <= 0:
+        fps = 20.0
+
+    width = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_WIDTH
+        )
+    )
+
+    height = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_HEIGHT
+        )
+    )
+
+    total_frames = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_COUNT
+        )
+    )
+
+    duration = (
+        total_frames / fps
+    )
+
+    print("=" * 65)
+    print("LANE CENTER DETECTION")
+    print("Canny Edge Detection + Hough Transform")
+    print("=" * 65)
+    print(f"Input video  : {input_path}")
+    print(
+        f"Resolution   : "
+        f"{width} x {height}"
+    )
+    print(f"FPS          : {fps:.2f}")
+    print(f"Frames       : {total_frames}")
+    print(f"Duration     : {duration:.2f} seconds")
+    print(f"Fixed Y axis : {Y_AXIS}")
+    print()
+
+    if Y_AXIS >= height:
+
+        cap.release()
+
+        raise ValueError(
+            f"Y_AXIS={Y_AXIS} is outside "
+            f"video height={height}."
+        )
+
+    # --------------------------------------------------------
+    # Output writers.
+    # --------------------------------------------------------
+
+    fourcc = cv2.VideoWriter_fourcc(
+        *"mp4v"
+    )
+
+    annotated_writer = cv2.VideoWriter(
+        str(annotated_path),
+        fourcc,
+        fps,
+        (width, height)
+    )
+
+    # Use 3-channel BGR for compatibility.
+    mask_writer = cv2.VideoWriter(
+        str(mask_path),
+        fourcc,
+        fps,
+        (width, height),
+        True
+    )
+
+    if not annotated_writer.isOpened():
+
+        cap.release()
+
+        raise RuntimeError(
+            "Could not create annotated video."
+        )
+
+    if not mask_writer.isOpened():
+
+        cap.release()
+        annotated_writer.release()
+
+        raise RuntimeError(
+            "Could not create mask video."
+        )
+
+    # --------------------------------------------------------
+    # Frame processing.
+    # --------------------------------------------------------
+
+    previous_state = None
+
+    results = []
+
+    processed = 0
+    detected = 0
+
+    print("Processing frames...")
+    print("-" * 65)
+
+    while True:
+
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        frame_number = processed
+
+        # ----------------------------------------------------
+        # Canny + Hough.
+        # ----------------------------------------------------
+
+        (
+            candidates,
+            edges,
+            roi_edges
+        ) = get_hough_candidates(
+            frame
+        )
+
+        # ----------------------------------------------------
+        # Group repeated Hough detections.
+        # ----------------------------------------------------
+
+        representatives = cluster_candidates(
+            candidates
+        )
+
+        # ----------------------------------------------------
+        # Build possible yellow+white lanes.
+        # ----------------------------------------------------
+
+        lane_pairs = build_lane_pairs(
+            representatives
+        )
+
+        # ----------------------------------------------------
+        # Select vehicle's lane.
+        # ----------------------------------------------------
+
+        lane_pair = select_lane_pair(
+            lane_pairs,
+            previous_state,
+            width
+        )
+
+        # ----------------------------------------------------
+        # Calculate center.
+        # ----------------------------------------------------
+
+        if lane_pair is not None:
+
+            left_x = lane_pair["left"]["x"]
+            right_x = lane_pair["right"]["x"]
+
+            center_x = (
+                left_x
+                + right_x
+            ) / 2.0
+
+            lane_width = (
+                right_x
+                - left_x
+            )
+
+            status = "detected"
+
+            previous_state = {
+                "left_x": left_x,
+                "right_x": right_x,
+                "center_x": center_x,
+                "width": lane_width
+            }
+
+            detected += 1
+
+        else:
+
+            left_x = None
+            right_x = None
+            center_x = None
+            lane_width = None
+            status = "not_detected"
+
+        # ----------------------------------------------------
+        # Segmentation.
+        # ----------------------------------------------------
+
+        if lane_pair is not None:
+
+            lane_mask = create_lane_mask(
+                frame.shape,
+                lane_pair["left"],
+                lane_pair["right"]
+            )
+
+        else:
+
+            lane_mask = np.zeros(
+                (height, width),
+                dtype=np.uint8
+            )
+
+        # ----------------------------------------------------
+        # Annotation.
+        # ----------------------------------------------------
+
+        annotated = draw_result(
+            frame,
+            lane_pair,
+            lane_mask,
+            candidates,
+            frame_number
+        )
+
+        # ----------------------------------------------------
+        # Write annotated video.
+        # ----------------------------------------------------
+
+        annotated_writer.write(
+            annotated
+        )
+
+        # Write mask as BGR.
+        mask_bgr = cv2.cvtColor(
+            lane_mask,
+            cv2.COLOR_GRAY2BGR
+        )
+
+        mask_writer.write(
+            mask_bgr
+        )
+
+        # ----------------------------------------------------
+        # Save individual frame.
+        # ----------------------------------------------------
+
+        if SAVE_INDIVIDUAL_FRAMES:
+
+            frame_path = (
+                frames_dir
+                / f"frame_{frame_number:04d}.jpg"
+            )
+
+            cv2.imwrite(
+                str(frame_path),
+                annotated,
+                [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    JPEG_QUALITY
+                ]
+            )
+
+        # ----------------------------------------------------
+        # CSV row.
+        # ----------------------------------------------------
+
+        results.append(
+            {
+                "frame": frame_number,
+                "time_sec": frame_number / fps,
+                "left_lane_boundary_x": left_x,
+                "right_lane_boundary_x": right_x,
+                "center_x": center_x,
+                "center_y": Y_AXIS,
+                "lane_width": lane_width,
+                "status": status
+            }
+        )
+
+        processed += 1
+
+        if (
+            processed % 20 == 0
+            or processed == total_frames
+        ):
+
+            percentage = (
+                processed
+                / total_frames
+                * 100
+                if total_frames > 0
+                else 0
+            )
+
+            print(
+                f"Processed "
+                f"{processed}/{total_frames} "
+                f"({percentage:.1f}%)"
+            )
+
+    # --------------------------------------------------------
+    # Release resources.
+    # --------------------------------------------------------
+
+    cap.release()
+    annotated_writer.release()
+    mask_writer.release()
+
+    # --------------------------------------------------------
+    # Save CSV.
+    # --------------------------------------------------------
+
+    df = pd.DataFrame(
+        results
+    )
+
+    df.to_csv(
+        str(csv_path),
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # Final report.
+    # --------------------------------------------------------
+
+    detection_rate = (
+        detected
+        / processed
+        * 100
+        if processed > 0
+        else 0
+    )
+
+    valid_centers = (
+        df["center_x"]
+        .dropna()
+        if not df.empty
+        else pd.Series(
+            dtype=float
+        )
+    )
+
+    print()
+    print("=" * 65)
+    print("PROCESSING COMPLETE")
+    print("=" * 65)
+    print(
+        f"Frames processed     : "
+        f"{processed}"
+    )
+    print(
+        f"Center detected      : "
+        f"{detected}/{processed} "
+        f"({detection_rate:.1f}%)"
+    )
+    print(
+        f"Fixed center Y       : "
+        f"{Y_AXIS}"
+    )
+
+    if len(valid_centers) > 0:
+
+        print(
+            f"Center X range       : "
+            f"{valid_centers.min():.2f} "
+            f"to "
+            f"{valid_centers.max():.2f}"
+        )
+
+        print(
+            f"Mean Center X        : "
+            f"{valid_centers.mean():.2f}"
+        )
+
+    print()
+    print("Outputs:")
+    print(
+        f"  {annotated_path}"
+    )
+    print(
+        f"  {mask_path}"
+    )
+    print(
+        f"  {csv_path}"
+    )
+
+    if SAVE_INDIVIDUAL_FRAMES:
+
+        print(
+            f"  {frames_dir}\\"
+        )
+
+    print("=" * 65)
+
+
+# ============================================================
+# COMMAND LINE
+# ============================================================
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Detect lane center using "
+            "Canny + Hough Transform."
+        )
+    )
+
+    parser.add_argument(
+        "--input",
+        default=DEFAULT_INPUT_VIDEO,
+        help=(
+            "Input MP4 video. "
+            "Default: clip_11.mp4"
+        )
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    args = parse_arguments()
+
+    process_video(
+        args.input
+    )
